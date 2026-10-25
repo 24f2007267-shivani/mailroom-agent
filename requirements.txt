@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30,<1
 httpx>=0.27,<1
 cryptography>=43,<47
 pydantic>=2.8,<3
+psycopg[binary]>=3.2,<4

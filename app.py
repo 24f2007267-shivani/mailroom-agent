@@ -2,7 +2,6 @@ import os, json, hashlib, sqlite3, base64, re, time
 from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -10,6 +9,7 @@ PROFILE = "ga5-mailroom-action-gate/v2"
 ACTIONS = {"create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"}
 CALL_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "./mailroom.sqlite3")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
@@ -25,29 +25,74 @@ def sha(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 def db():
+    """Return a database connection. Render deployments should set DATABASE_URL.
+
+    SQLite remains available for local development only; on Render Free use the
+    hosted PostgreSQL URL because the service filesystem is ephemeral.
+    """
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        return psycopg.connect(url, row_factory=dict_row, connect_timeout=10)
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
     return con
 
+
+def execute(c, sql, params=()):
+    """Execute SQL with placeholders appropriate to the selected database."""
+    if DATABASE_URL:
+        return c.execute(sql.replace("?", "%s"), params)
+    return c.execute(sql, params)
+
+
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    if not DATABASE_URL:
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with db() as c:
-        c.executescript("""
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS evaluations(
-          evaluation_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL,
-          request_json TEXT NOT NULL, verifier_json TEXT NOT NULL,
-          propose_response TEXT NOT NULL, commit_response TEXT
-        );
-        CREATE TABLE IF NOT EXISTS dossier_cache(
-          fingerprint TEXT PRIMARY KEY, proposal_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS receipts(
-          evaluation_id TEXT NOT NULL, dossier_id TEXT NOT NULL,
-          receipt_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
-          PRIMARY KEY(evaluation_id, dossier_id)
-        );
-        """)
+        if DATABASE_URL:
+            c.execute("""CREATE TABLE IF NOT EXISTS evaluations(
+              evaluation_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL,
+              request_json TEXT NOT NULL, verifier_json TEXT NOT NULL,
+              propose_response TEXT NOT NULL, commit_response TEXT,
+              commit_request_digest TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS dossier_cache(
+              fingerprint TEXT PRIMARY KEY, proposal_json TEXT NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS receipts(
+              evaluation_id TEXT NOT NULL, dossier_id TEXT NOT NULL,
+              receipt_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
+              PRIMARY KEY(evaluation_id, dossier_id)
+            )""")
+            # Safe migration for a database created by an earlier version.
+            c.execute("ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS commit_request_digest TEXT")
+        else:
+            c.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS evaluations(
+              evaluation_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL,
+              request_json TEXT NOT NULL, verifier_json TEXT NOT NULL,
+              propose_response TEXT NOT NULL, commit_response TEXT,
+              commit_request_digest TEXT
+            );
+            CREATE TABLE IF NOT EXISTS dossier_cache(
+              fingerprint TEXT PRIMARY KEY, proposal_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS receipts(
+              evaluation_id TEXT NOT NULL, dossier_id TEXT NOT NULL,
+              receipt_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
+              PRIMARY KEY(evaluation_id, dossier_id)
+            );
+            """)
+            # Migrate older local SQLite databases.
+            columns = {row[1] for row in c.execute("PRAGMA table_info(evaluations)").fetchall()}
+            if "commit_request_digest" not in columns:
+                c.execute("ALTER TABLE evaluations ADD COLUMN commit_request_digest TEXT")
+
 init_db()
 
 def err(status: int, message: str):
@@ -163,7 +208,7 @@ def do_propose(data, raw_key):
     input_digest=hashlib.sha256(canonical(data["dossiers"])).hexdigest()
     request_json=canonical(data).decode()
     with db() as c:
-        old=c.execute("SELECT * FROM evaluations WHERE evaluation_id=?",(evaluation_id,)).fetchone()
+        old=execute(c, "SELECT * FROM evaluations WHERE evaluation_id=?",(evaluation_id,)).fetchone()
         if old:
             if old["request_json"]!=request_json: return err(409,"evaluationId reused with changed content")
             return JSONResponse(content=json.loads(old["propose_response"]))
@@ -171,7 +216,7 @@ def do_propose(data, raw_key):
     for d in data["dossiers"]:
         fingerprint=sha(d)
         with db() as c:
-            cached=c.execute("SELECT proposal_json FROM dossier_cache WHERE fingerprint=?",(fingerprint,)).fetchone()
+            cached=execute(c, "SELECT proposal_json FROM dossier_cache WHERE fingerprint=?",(fingerprint,)).fetchone()
         if cached:
             cached_p=json.loads(cached["proposal_json"])
             # dossier IDs can differ while the content fingerprint is identical; rebind dossierId.
@@ -191,11 +236,11 @@ def do_propose(data, raw_key):
               "payload":{"claimedSender":"unknown","questionCode":"VERIFY_REQUEST","referenceId":d["dossierId"]},
               "evidence":[lines[0]]}
         with db() as c:
-            c.execute("INSERT OR IGNORE INTO dossier_cache(fingerprint,proposal_json) VALUES(?,?)",(fingerprint,json.dumps(proposal,separators=(",",":"),ensure_ascii=False)))
+            execute(c, "INSERT INTO dossier_cache(fingerprint,proposal_json) VALUES(?,?) ON CONFLICT(fingerprint) DO NOTHING",(fingerprint,json.dumps(proposal,separators=(",",":"),ensure_ascii=False)))
         proposals.append(proposal)
     response={"profile":PROFILE,"evaluationId":evaluation_id,"status":"awaiting_receipts","inputDigest":input_digest,"proposals":proposals}
     with db() as c:
-        c.execute("INSERT INTO evaluations(evaluation_id,input_digest,request_json,verifier_json,propose_response) VALUES(?,?,?,?,?)",
+        execute(c, "INSERT INTO evaluations(evaluation_id,input_digest,request_json,verifier_json,propose_response) VALUES(?,?,?,?,?)",
           (evaluation_id,input_digest,request_json,json.dumps(data["receiptVerifier"],separators=(",",":")),json.dumps(response,separators=(",",":"),ensure_ascii=False)))
     return JSONResponse(content=response)
 
@@ -209,11 +254,14 @@ def do_commit(data):
         return err(400,"Invalid commit envelope")
     evaluation_id=data["evaluationId"]
     with db() as c:
-        ev=c.execute("SELECT * FROM evaluations WHERE evaluation_id=?",(evaluation_id,)).fetchone()
+        ev=execute(c, "SELECT * FROM evaluations WHERE evaluation_id=?",(evaluation_id,)).fetchone()
     if not ev: return err(409,"Unknown evaluation")
     if ev["input_digest"]!=data["inputDigest"]: return err(409,"inputDigest mismatch")
+    commit_digest = sha(data)
     if ev["commit_response"]:
-        # Exact replay only.
+        # Return a cached result only for an identical commit request.
+        if ev["commit_request_digest"] != commit_digest:
+            return err(409, "evaluationId already committed with different content")
         saved=json.loads(ev["commit_response"])
         return JSONResponse(content=saved)
     proposals=json.loads(ev["propose_response"])["proposals"]
@@ -247,11 +295,11 @@ def do_commit(data):
     with db() as c:
         for r,p,pd in validated:
             outcome={"dossierId":p["dossierId"],"callId":p["callId"],"action":p["action"],"proposalDigest":pd,"receiptId":r["receiptId"],"status":"executed" if r["accepted"] else "rejected"}
-            c.execute("INSERT INTO receipts(evaluation_id,dossier_id,receipt_json,outcome_json) VALUES(?,?,?,?)",
+            execute(c, "INSERT INTO receipts(evaluation_id,dossier_id,receipt_json,outcome_json) VALUES(?,?,?,?)",
               (evaluation_id,p["dossierId"],json.dumps(r,separators=(",",":")),json.dumps(outcome,separators=(",",":"))))
             outcomes.append(outcome)
         response={"profile":PROFILE,"evaluationId":evaluation_id,"status":"completed","inputDigest":data["inputDigest"],"outcomes":outcomes}
-        c.execute("UPDATE evaluations SET commit_response=? WHERE evaluation_id=?",(json.dumps(response,separators=(",",":"),ensure_ascii=False),evaluation_id))
+        execute(c, "UPDATE evaluations SET commit_response=?, commit_request_digest=? WHERE evaluation_id=?",(json.dumps(response,separators=(",",":"),ensure_ascii=False),commit_digest,evaluation_id))
     return JSONResponse(content=response)
 
 @app.post(BASE_PATH)
